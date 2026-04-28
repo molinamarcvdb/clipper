@@ -161,12 +161,19 @@ def triton_matmul(cdY_ptr, X_ptr, g_ptr, M, N, K,
 
     # Loop over K dimension in tiles of BLOCK_K
     for k_start in range(0, K, BLOCK_K):
-        a_tile = tl.load(cdY_ptr + offs_m[:, None] * stride_am + (k_start + offs_k)[None, :] * stride_ak)
-        b_tile = tl.load(X_ptr + (k_start + offs_k)[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+        k_mask = (k_start + offs_k) < K
+        a_mask = (offs_m[:, None] < M) & (k_mask[None, :])
+        b_mask = (k_mask[:, None]) & (offs_n[None, :] < N)
+
+        a_tile = tl.load(cdY_ptr + offs_m[:, None] * stride_am + (k_start + offs_k)[None, :] * stride_ak, mask=a_mask, other=0.0)
+        b_tile = tl.load(X_ptr + (k_start + offs_k)[:, None] * stride_bk + offs_n[None, :] * stride_bn, mask=b_mask, other=0.0)
+
         acc += tl.dot(a_tile, b_tile)
 
     # Write back
-    tl.store(g_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, acc)
+    c_mask = (offs_m[:, None]<M) & (offs_n[None, :]<N)
+    tl.store(g_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, acc, mask=c_mask)
 
 def triton_clipping(X: torch.Tensor, dY: torch.Tensor, C: float, sigma: float):
     """Initally we will create two kernels one that computes grad norms and then another applying the actual 
@@ -191,7 +198,7 @@ def triton_clipping(X: torch.Tensor, dY: torch.Tensor, C: float, sigma: float):
     
     cdY = dY * c[:, None]
 
-    g = torch.empty((Dout, Din), device=device)
+    g = torch.zeros((Dout, Din), device=device)
     grid = (triton.cdiv(Dout, BLOCK_M), triton.cdiv(Din, BLOCK_N))
     triton_matmul[grid](cdY_ptr=cdY, X_ptr=X, g_ptr=g, M=Dout, N=Din, K=B, stride_am=cdY.stride(1), stride_ak=cdY.stride(0), 
                        stride_bk=X.stride(0), stride_bn=X.stride(1), stride_cm=g.stride(0), stride_cn=g.stride(1),
@@ -203,7 +210,7 @@ def triton_clipping(X: torch.Tensor, dY: torch.Tensor, C: float, sigma: float):
 if __name__ == "__main__":
 
     X = torch.randn(1024, 4096, device="cuda")
-    dY = torch.randn(1024, 1000, device="cuda")
+    dY = torch.randn(1024, 4096, device="cuda")
     C = 1.0
     sigma = 1.0
     seed = 67
@@ -214,7 +221,7 @@ if __name__ == "__main__":
     out_ghost = ghost_clipping(X, dY, C, sigma=0.0)
     out_triton_ghost = triton_clipping(X, dY, C, sigma=0.0)
     
-    assert torch.allclose(out_triton_ghost, out_ghost, atol=1e-3), f"max diff: {(norms - ref).abs().max().item()}"
+    assert torch.allclose(out_triton_ghost, out_ghost, atol=1e-4), f"max diff: {(out_triton_ghost - out_ghost).abs().max().item()}"
 
     ms = do_bench(lambda: triton_clipping(X, dY, C=1.0, sigma=0.0))
     print(f"triton: {ms:.3f} ms")
