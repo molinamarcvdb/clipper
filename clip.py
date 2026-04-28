@@ -1,12 +1,15 @@
 ### Implementation of various clipping methods from stadard to ghost clipping to triton implmentation
 
 import torch
+import triton
+import triton.language as tl
 from typing import Callable
 
 import time
 import functools
 import torch
 
+from triton.testing import do_bench
 
 def profile(fn):
     @functools.wraps(fn)
@@ -70,19 +73,66 @@ def ghost_clipping(X, dY, C, sigma):
     noise = torch.randn(g.shape, device=g.device, dtype=g.dtype)
     return g + sigma * C * noise
 
+@triton.jit
+def triton_sq_norm(X_ptr: torch.Tensor, norms_ptr: torch.Tensor, B: int, D: int, BLOCK_B: tl.constexpr, BLOCK_D: tl.constexpr, stride_b, stride_d):
+    
+    pid = tl.program_id(axis=0)
+    sample_offsets = pid * BLOCK_B + tl.arange(0, BLOCK_B)
+    sample_masks = sample_offsets < B
+    
+    acc = tl.zeros((BLOCK_B,), tl.float32)
+
+    for d_start in range(0, D, BLOCK_D):
+        feature_offsets = d_start + tl.arange(0, BLOCK_D)
+        feature_masks = feature_offsets < D
+
+        ptrs = X_ptr + sample_offsets[:, None] * stride_b + feature_offsets[None, :] * stride_d
+        
+        mask_2d = sample_masks[:, None] & feature_masks[None, :]
+        
+        tile = tl.load(ptrs, mask=mask_2d, other=0.0)
+        acc += tl.sum(tile*tile, axis=1)
+
+    tl.store(norms_ptr + sample_offsets, acc, mask=sample_masks)
+
+    # frist we need to x * x sum
+
+def triton_clipping(X: torch.Tensor, dY: torch.Tensor, C: float, sigma: float):
+    """Initally we will create two kernels one that computes grad norms and then another applying the actual 
+        c_i to gradsient collapsin to batched gradient plus noise"""
+    
+    B, Din = X.shape
+    _, Dout = dY.shape
+    device = X.device
+
+    norms_ptr = torch.empty((B,), device=device)
+    
+    BLOCK_B = 8
+    BLOCK_D = 64
+    stride_b = Din
+    stride_d = 1
+    
+    grid = (triton.cdiv(B, BLOCK_B),) 
+    triton_sq_norm[grid](X, norms_ptr, B, Din, BLOCK_B, BLOCK_D, stride_b, stride_d)
+
+    return norms_ptr
 
 if __name__ == "__main__":
-    X = torch.randn(256, 4096)
-    dY = torch.randn(256, 1000)
+
+    X = torch.randn(1024, 4096, device="cuda")
+    dY = torch.randn(1024, 1000, device="cuda")
     C = 1.0
     sigma = 1.0
     seed = 67
 
     torch.manual_seed(0)
-    out_naive = naive_per_sample(X, dY, C, sigma=0.0)
+    #out_naive = naive_per_sample(X, dY, C, sigma=0.0)
     torch.manual_seed(0)
-    out_ghost = ghost_clipping(X, dY, C, sigma=0.0)
-    assert torch.allclose(out_naive, out_ghost, atol=1e-4), (
-        f"max diff: {(out_naive - out_ghost).abs().max()}"
-    )
-    print("✓ methods agree")
+    #out_ghost = ghost_clipping(X, dY, C, sigma=0.0)
+    norms = triton_clipping(X, dY, C, sigma=0.0)
+
+    ms = do_bench(lambda: triton_clipping(X, dY, C=1.0, sigma=0.0))
+    print(f"triton: {ms:.3f} ms")
+
+    ms = do_bench(lambda: (X * X).sum(dim=1))
+    print(f"pytorch: {ms:.3f} ms")
